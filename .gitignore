@@ -1,0 +1,9 @@
+/vendor/
+/.env
+/.phpunit.cache/
+/.idea/
+/.vscode/
+.DS_Store
+
+# File temporanei prodotti dal crawler locale
+/storage/import/
