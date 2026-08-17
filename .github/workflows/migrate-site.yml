@@ -1,0 +1,105 @@
+name: Migrate live site to Slim 4
+
+on:
+  push:
+    branches:
+      - agent/slim4-rebuild
+    paths:
+      - tools/import_wordpress.py
+      - .github/workflows/migrate-site.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout migration branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install crawler dependencies
+        run: python -m pip install --disable-pip-version-check requests beautifulsoup4
+
+      - name: Validate crawler syntax
+        run: python -m py_compile tools/import_wordpress.py
+
+      - name: Import live WordPress site
+        run: >-
+          python tools/import_wordpress.py
+          --base-url https://chiabeatslife.jacopoellero.it/
+          --output .
+          --max-pages 1200
+
+      - name: Validate required public pages and legacy assets
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          routes = json.loads(Path('storage/site-map.json').read_text(encoding='utf-8'))
+          paths = {item['path'] for item in routes}
+          required = {
+              '/',
+              '/la-mia-storia/',
+              '/formati-con-me/',
+              '/risorse-per-te/',
+              '/blog/',
+              '/contatti/',
+              '/privacy-policy/',
+              '/cookie-policy/',
+              '/terms-conditions/',
+          }
+          missing = sorted(required - paths)
+          if missing:
+              raise SystemExit('Pagine pubbliche mancanti: ' + ', '.join(missing))
+
+          report = json.loads(Path('storage/migration-report.json').read_text(encoding='utf-8'))
+          if report.get('css_assets', 0) < 1:
+              raise SystemExit('Nessun CSS legacy importato')
+          if report.get('js_assets', 0) < 1:
+              raise SystemExit('Nessun JavaScript legacy importato')
+          print(f"Pagine: {report['pages']} | asset: {report['assets']} | CSS: {report['css_assets']} | JS: {report['js_assets']}")
+          if report.get('runtime_dependencies'):
+              print('Dipendenze WordPress residue rilevate (non bloccanti):')
+              for name, pages in report['runtime_dependencies'].items():
+                  print(f"- {name}: {len(pages)} pagina/e")
+          PY
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          tools: composer:v2
+          coverage: none
+
+      - name: Validate Composer manifest
+        run: composer validate --strict --no-check-publish
+
+      - name: Install PHP dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Run Slim checks
+        run: composer check
+
+      - name: Commit imported pages and original assets
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add config/routes.php composer.lock public storage/pages storage/site-map.json storage/migration-report.json
+          if git diff --cached --quiet; then
+            echo "Nessuna modifica generata"
+            exit 0
+          fi
+          git commit -m "Import live Chiabeatslife pages and legacy assets"
+          git push origin HEAD:${GITHUB_REF_NAME}
