@@ -28,6 +28,10 @@
     "allow-plugins": {},
     "optimize-autoloader": true,
     "sort-packages": true,
+    "preferred-install": "source",
+    "github-protocols": [
+      "https"
+    ],
     "platform": {
       "php": "8.3.0"
     }
