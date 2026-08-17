@@ -12,10 +12,13 @@ declare(strict_types=1);
  * Requisiti PHP: 8.3+, curl, zip.
  */
 
+const DEPLOY_VERSION = '2026-08-17.6';
 const DEPLOY_REPOSITORY = 'jellero/chiabeatslife';
 const DEPLOY_BRANCH = 'main';
-const DEPLOY_APP_URL = 'https://chiabeatslife.jacopoellero.it';
+const DEPLOY_SOURCE_URL = 'https://chiabeatslife.jacopoellero.it';
+const DEPLOY_TARGET_FALLBACK_URL = 'https://chiabeatslife.jacopoellero.it';
 const DEPLOY_HEALTH_PATH = '/api/v1/health';
+const DEPLOY_IMPORT_MAX_PAGES = 1200;
 const DEPLOY_LIVE_DIR = 'chiabeatslife-site';
 const DEPLOY_STATE_DIR = '.chiabeatslife-deploy';
 const DEPLOY_MAINTENANCE_FILE = '.chiabeatslife-maintenance.html';
@@ -126,6 +129,17 @@ function isLocalRequest(): bool
 function currentScriptUrl(): string
 {
     return (string) ($_SERVER['SCRIPT_NAME'] ?? '/deploy.php');
+}
+
+function deployTargetUrl(): string
+{
+    $host = trim((string) ($_SERVER['HTTP_HOST'] ?? ''));
+    if ($host === '' || !preg_match('/^[A-Za-z0-9.-]+(?::[0-9]{1,5})?$/', $host)) {
+        return DEPLOY_TARGET_FALLBACK_URL;
+    }
+
+    $scheme = isHttpsRequest() ? 'https' : 'http';
+    return $scheme . '://' . $host;
 }
 
 function csrfField(): string
@@ -267,13 +281,13 @@ function renderDeployForm(string $liveDir, ?string $error = null, ?array $result
     $needsCompletion = in_array($deployStatus, ['awaiting_composer', 'maintenance'], true);
     $migration = inspectMigrationReport($liveDir);
 
-    $body = '<div class="topbar"><div><strong>Chiabeatslife</strong><small>Deploy Plesk + GitHub</small></div>'
+    $body = '<div class="topbar"><div><strong>Chiabeatslife</strong><small>Deploy Plesk + GitHub · v' . e(DEPLOY_VERSION) . '</small></div>'
         . '<form method="post" class="inline">' . csrfField() . '<input type="hidden" name="action" value="logout"><button class="secondary" type="submit">Esci</button></form></div>'
         . '<div class="card wide"><h1>' . ($firstInstall ? 'Prima inizializzazione' : 'Aggiornamento') . '</h1>'
         . '<div class="status">'
         . '<span>Repository</span><code>' . e(DEPLOY_REPOSITORY) . '</code>'
         . '<span>Branch</span><code>' . e(DEPLOY_BRANCH) . '</code>'
-        . '<span>Applicazione</span><code>' . e(DEPLOY_APP_URL) . '</code>'
+        . '<span>Applicazione</span><code>' . e(deployTargetUrl()) . '</code>'
         . '<span>Release attuale</span><code>' . $currentLabel . '</code>'
         . '<span>.env</span><code>' . ($envPath ? 'presente' : 'mancante') . '</code>'
         . '<span>vendor</span><code>' . ($vendorPath ? 'presente' : 'mancante') . '</code>'
@@ -302,8 +316,8 @@ function renderDeployForm(string $liveDir, ?string $error = null, ?array $result
         $body .= '<form method="post" autocomplete="off">' . csrfField()
             . '<input type="hidden" name="action" value="install">'
             . '<fieldset><legend>Prima inizializzazione</legend>'
-            . '<p>Scarica <code>main</code>, verifica che siano presenti gli snapshot del sito importato, crea <code>.env</code> per il dominio Chiabeatslife e prepara la nuova release in <code>/' . e(DEPLOY_LIVE_DIR) . '</code>.</p>'
-            . '<p>Il WordPress corrente non viene cancellato. Il routing pubblico viene sostituito solo dal router del deployer; i backup delle release Slim vengono conservati separatamente.</p>'
+            . '<p>Scarica <code>main</code>, importa automaticamente il WordPress live, genera snapshot/asset/route e crea <code>.env</code> per la destinazione.</p>'
+            . '<p>Il WordPress corrente viene letto prima del cut-over. Se l’import fallisce, il routing pubblico non viene sostituito.</p>'
             . field('Scrivi INSTALLA', 'confirmation', 'text', '', true, 'pattern="INSTALLA" autocomplete="off"')
             . '</fieldset>'
             . '<button type="submit">Esegui prima inizializzazione</button></form></div>';
@@ -311,7 +325,7 @@ function renderDeployForm(string $liveDir, ?string $error = null, ?array $result
         $body .= '<form method="post">' . csrfField()
             . '<input type="hidden" name="action" value="update">'
             . '<fieldset><legend>Aggiornamento</legend>'
-            . '<p>Scarica l’ultimo commit di <code>main</code> e crea una nuova release atomica. Vengono conservati automaticamente <code>.env</code> e <code>vendor/</code>.</p>'
+            . '<p>Scarica l’ultimo commit di <code>main</code> e crea una nuova release atomica. Vengono conservati automaticamente <code>.env</code>, <code>vendor/</code> e gli snapshot/asset importati sul server.</p>'
             . '<p>Se cambia <code>composer.json</code> o <code>composer.lock</code>, la release resta in manutenzione finché Plesk Composer non viene aggiornato.</p>'
             . field('Scrivi AGGIORNA', 'confirmation', 'text', '', true, 'pattern="AGGIORNA" autocomplete="off"')
             . '</fieldset>'
@@ -331,7 +345,6 @@ function handleDeploy(string $documentRoot, string $stateDir, string $liveDir, s
 
     try {
         validateRuntime();
-
         $expectedConfirmation = $mode === 'install' ? 'INSTALLA' : 'AGGIORNA';
         if ((string) ($_POST['confirmation'] ?? '') !== $expectedConfirmation) {
             throw new RuntimeException('Conferma non valida: scrivi ' . $expectedConfirmation . '.');
@@ -339,10 +352,10 @@ function handleDeploy(string $documentRoot, string $stateDir, string $liveDir, s
 
         $existingEnv = is_file($liveDir . '/.env');
         if ($mode === 'install' && $existingEnv) {
-            throw new RuntimeException('Esiste già una release inizializzata: usa la modalità aggiornamento.');
+            throw new RuntimeException('Esiste già un .env nella release: usa la modalità aggiornamento.');
         }
         if ($mode === 'update' && !$existingEnv) {
-            throw new RuntimeException('Manca .env nella release corrente: devi eseguire prima l’inizializzazione.');
+            throw new RuntimeException('Manca .env: devi eseguire prima la prima inizializzazione.');
         }
 
         $lockHandle = fopen($stateDir . '/deploy.lock', 'c+');
@@ -354,29 +367,26 @@ function handleDeploy(string $documentRoot, string $stateDir, string $liveDir, s
         $archiveFile = $workDir . '/source.zip';
         $extractDir = $workDir . '/extract';
         $releaseDir = $stateDir . '/release-' . gmdate('YmdHis') . '-' . bin2hex(random_bytes(3));
-
         mkdirOrFail($workDir, 0700);
         mkdirOrFail($extractDir, 0700);
 
         $commit = resolveBranchCommit();
-        downloadArchive($commit, $archiveFile);
-        extractZipSafely($archiveFile, $extractDir);
-        $sourceDir = locateSourceDirectory($extractDir);
+        $sourceDir = downloadRepositorySource($commit, $workDir, $archiveFile, $extractDir);
         validateSourceTree($sourceDir);
         copyDirectory($sourceDir, $releaseDir);
 
-        $oldComposerLockHash = hashOptionalFile($liveDir . '/composer.lock');
-        $newComposerLockHash = hashOptionalFile($releaseDir . '/composer.lock');
-        $oldComposerJsonHash = hashOptionalFile($liveDir . '/composer.json');
-        $newComposerJsonHash = hashOptionalFile($releaseDir . '/composer.json');
+        $oldComposerJsonHash = is_file($liveDir . '/composer.json') ? hash_file('sha256', $liveDir . '/composer.json') : null;
+        $newComposerJsonHash = is_file($releaseDir . '/composer.json') ? hash_file('sha256', $releaseDir . '/composer.json') : null;
+        $oldComposerLockHash = is_file($liveDir . '/composer.lock') ? hash_file('sha256', $liveDir . '/composer.lock') : null;
+        $newComposerLockHash = is_file($releaseDir . '/composer.lock') ? hash_file('sha256', $releaseDir . '/composer.lock') : null;
         $composerChanged = $mode === 'update'
-            && ($oldComposerLockHash !== $newComposerLockHash || $oldComposerJsonHash !== $newComposerJsonHash);
+            && ($oldComposerJsonHash !== $newComposerJsonHash || $oldComposerLockHash !== $newComposerLockHash);
 
         $preserved = preserveRuntimeData($liveDir, $releaseDir);
+        $migration = prepareImportedSite($liveDir, $releaseDir, $stateDir, $mode);
 
         if ($mode === 'install') {
-            $envContent = buildEnvFile();
-            if (file_put_contents($releaseDir . '/.env', $envContent, LOCK_EX) === false) {
+            if (file_put_contents($releaseDir . '/.env', buildEnvFile(), LOCK_EX) === false) {
                 throw new RuntimeException('Impossibile creare .env.');
             }
             chmodSafe($releaseDir . '/.env', DEPLOY_SECRET_MODE);
@@ -385,7 +395,7 @@ function handleDeploy(string $documentRoot, string $stateDir, string $liveDir, s
         }
 
         fixReleasePermissions($releaseDir);
-        $migration = verifyRelease($releaseDir);
+        verifyRelease($releaseDir);
 
         $vendorReady = is_file($releaseDir . '/vendor/autoload.php');
         $awaitingComposer = !$vendorReady || $composerChanged;
@@ -409,6 +419,9 @@ function handleDeploy(string $documentRoot, string $stateDir, string $liveDir, s
         $activated = true;
         fixReleasePermissions($liveDir);
 
+        if ($awaitingComposer) {
+            installMaintenanceRouter($documentRoot, $stateDir);
+        }
         cleanupOldBackups($stateDir . '/backups', DEPLOY_BACKUPS_TO_KEEP);
 
         if ($workDir !== null && is_dir($workDir)) {
@@ -417,15 +430,14 @@ function handleDeploy(string $documentRoot, string $stateDir, string $liveDir, s
         }
 
         if ($awaitingComposer) {
-            installMaintenanceRouter($documentRoot, $stateDir);
             appendDeployLog($stateDir, [
                 'time' => gmdate(DATE_ATOM),
                 'commit' => $commit,
                 'result' => 'awaiting_composer',
                 'mode' => $mode,
-                'composer_manifest_changed' => $composerChanged,
                 'pages' => $migration['pages'],
                 'assets' => $migration['assets'],
+                'composer_manifest_changed' => $composerChanged,
                 'ip' => clientIp(),
             ]);
 
@@ -449,7 +461,13 @@ function handleDeploy(string $documentRoot, string $stateDir, string $liveDir, s
             $meta['health_status'] = $health['status'] ?? null;
             writeJsonFile($liveDir . '/.deploy-meta.json', $meta, DEPLOY_FILE_MODE);
             installMaintenanceRouter($documentRoot, $stateDir);
-            throw new RuntimeException('La nuova release non supera l’health check Slim. Il sito è stato lasciato in manutenzione.');
+            throw new RuntimeException(
+                'Health check Slim fallito su ' . (string) ($health['url'] ?? deployTargetUrl())
+                . ' (HTTP ' . (string) ($health['status'] ?? 'nessuna risposta') . '). '
+                . (($health['message'] ?? '') !== '' ? 'Errore: ' . (string) $health['message'] . '. ' : '')
+                . (($health['body'] ?? '') !== '' ? 'Risposta: ' . (string) $health['body'] . '. ' : '')
+                . 'Il sito è stato lasciato in manutenzione.'
+            );
         }
 
         appendDeployLog($stateDir, [
@@ -477,7 +495,6 @@ function handleDeploy(string $documentRoot, string $stateDir, string $liveDir, s
         if ($workDir !== null && is_dir($workDir)) {
             removeDirectory($workDir);
         }
-
         appendDeployLog($stateDir, [
             'time' => gmdate(DATE_ATOM),
             'result' => 'failed',
@@ -522,7 +539,13 @@ function handleComplete(string $documentRoot, string $stateDir, string $liveDir)
             $meta['health_status'] = $health['status'] ?? null;
             writeJsonFile($liveDir . '/.deploy-meta.json', $meta, DEPLOY_FILE_MODE);
             installMaintenanceRouter($documentRoot, $stateDir);
-            throw new RuntimeException('Le dipendenze sono presenti, ma l’applicazione non supera ancora l’health check Slim. Il sito resta in manutenzione.');
+            throw new RuntimeException(
+                'Health check Slim fallito su ' . (string) ($health['url'] ?? deployTargetUrl())
+                . ' (HTTP ' . (string) ($health['status'] ?? 'nessuna risposta') . '). '
+                . (($health['message'] ?? '') !== '' ? 'Errore: ' . (string) $health['message'] . '. ' : '')
+                . (($health['body'] ?? '') !== '' ? 'Risposta: ' . (string) $health['body'] . '. ' : '')
+                . 'Il sito resta in manutenzione.'
+            );
         }
 
         $meta['status'] = 'ready';
@@ -543,8 +566,8 @@ function handleComplete(string $documentRoot, string $stateDir, string $liveDir)
 
         renderDeployForm($liveDir, null, [
             'commit' => (string) ($meta['commit'] ?? ''),
-            'health' => $health,
             'migration' => $migration,
+            'health' => $health,
             'awaiting_composer' => false,
             'completed' => true,
         ]);
@@ -572,7 +595,7 @@ function buildEnvFile(): string
         '# Generato da deploy.php',
         'APP_DEBUG=0',
         'APP_BASE_PATH=',
-        'APP_URL=' . DEPLOY_APP_URL,
+        'APP_URL=' . deployTargetUrl(),
         '',
     ]);
 }
@@ -596,21 +619,197 @@ function resolveBranchCommit(): string
     return $sha;
 }
 
+function downloadRepositorySource(string $commit, string $workDir, string $archiveFile, string $extractDir): string
+{
+    $apiDir = $workDir . '/api-source';
+
+    try {
+        downloadRepositoryViaApi($commit, $apiDir);
+        return $apiDir;
+    } catch (Throwable $apiException) {
+        appendDeployDiagnostic($workDir, 'Download GitHub API fallito: ' . sanitizeLogMessage($apiException->getMessage()));
+    }
+
+    try {
+        downloadArchive($commit, $archiveFile);
+        extractZipSafely($archiveFile, $extractDir);
+        return locateSourceDirectory($extractDir);
+    } catch (Throwable $archiveException) {
+        $diagnostic = readTextFileSafe($workDir . '/download-diagnostic.log');
+        $prefix = $diagnostic !== '' ? trim($diagnostic) . ' | ' : '';
+        throw new RuntimeException($prefix . 'Fallback ZIP GitHub fallito: ' . $archiveException->getMessage(), 0, $archiveException);
+    }
+}
+
+function downloadRepositoryViaApi(string $commit, string $destination): void
+{
+    [$owner, $repo] = explode('/', DEPLOY_REPOSITORY, 2);
+    $commitUrl = 'https://api.github.com/repos/' . rawurlencode($owner) . '/' . rawurlencode($repo) . '/git/commits/' . rawurlencode($commit);
+    $commitResponse = githubApiRequest($commitUrl, 30, 2_000_000);
+
+    if ($commitResponse['status'] !== 200) {
+        throw new RuntimeException('GitHub commit API HTTP ' . $commitResponse['status'] . '.');
+    }
+
+    $commitData = json_decode($commitResponse['body'], true, 512, JSON_THROW_ON_ERROR);
+    $treeSha = is_array($commitData) ? (string) ($commitData['tree']['sha'] ?? '') : '';
+    if (!preg_match('/^[a-f0-9]{40}$/', $treeSha)) {
+        throw new RuntimeException('GitHub commit API non ha restituito un tree SHA valido.');
+    }
+
+    $treeUrl = 'https://api.github.com/repos/' . rawurlencode($owner) . '/' . rawurlencode($repo) . '/git/trees/' . rawurlencode($treeSha) . '?recursive=1';
+    $treeResponse = githubApiRequest($treeUrl, 45, 8_000_000);
+    if ($treeResponse['status'] !== 200) {
+        throw new RuntimeException('GitHub tree API HTTP ' . $treeResponse['status'] . '.');
+    }
+
+    $treeData = json_decode($treeResponse['body'], true, 512, JSON_THROW_ON_ERROR);
+    if (!is_array($treeData) || !empty($treeData['truncated']) || !isset($treeData['tree']) || !is_array($treeData['tree'])) {
+        throw new RuntimeException('GitHub tree API ha restituito un albero incompleto.');
+    }
+
+    mkdirOrFail($destination, 0700);
+    $fileCount = 0;
+    $totalBytes = 0;
+
+    foreach ($treeData['tree'] as $entry) {
+        if (!is_array($entry) || ($entry['type'] ?? null) !== 'blob') {
+            continue;
+        }
+
+        $path = (string) ($entry['path'] ?? '');
+        $size = (int) ($entry['size'] ?? 0);
+        if (!isSafeRepositoryPath($path)) {
+            throw new RuntimeException('GitHub tree contiene un percorso non sicuro: ' . $path);
+        }
+        if ($size > 100_000_000) {
+            throw new RuntimeException('File GitHub troppo grande per il deploy: ' . $path);
+        }
+
+        $destinationFile = $destination . '/' . $path;
+        mkdirOrFail(dirname($destinationFile), DEPLOY_DIR_MODE);
+
+        $rawUrl = 'https://raw.githubusercontent.com/'
+            . rawurlencode($owner) . '/' . rawurlencode($repo) . '/' . rawurlencode($commit) . '/' . rawPath($path);
+        downloadRawFile($rawUrl, $destinationFile, max(1, $size));
+
+        $actual = filesize($destinationFile);
+        if ($actual === false) {
+            throw new RuntimeException('Impossibile verificare il file GitHub scaricato: ' . $path);
+        }
+        $totalBytes += (int) $actual;
+        $fileCount++;
+
+        if ($totalBytes > DEPLOY_MAX_ARCHIVE_BYTES) {
+            throw new RuntimeException('Repository oltre il limite massimo previsto dal deployer.');
+        }
+    }
+
+    if ($fileCount === 0) {
+        throw new RuntimeException('GitHub tree non contiene file scaricabili.');
+    }
+}
+
+function githubApiRequest(string $url, int $timeout, int $maxBytes): array
+{
+    return httpRequestWithRetry(
+        $url,
+        [
+            'Accept: application/vnd.github+json',
+            'X-GitHub-Api-Version: 2022-11-28',
+        ],
+        $timeout,
+        $maxBytes,
+        4
+    );
+}
+
+function downloadRawFile(string $url, string $destination, int $expectedSize): void
+{
+    $maxBytes = min(100_000_000, max($expectedSize + 1_048_576, $expectedSize * 2));
+    $last = null;
+
+    for ($attempt = 1; $attempt <= 4; $attempt++) {
+        $body = '';
+        $curl = curl_init($url);
+        if ($curl === false) {
+            throw new RuntimeException('Impossibile inizializzare cURL per file GitHub.');
+        }
+
+        curl_setopt_array($curl, [
+            CURLOPT_RETURNTRANSFER => false,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 5,
+            CURLOPT_CONNECTTIMEOUT => 15,
+            CURLOPT_TIMEOUT => 90,
+            CURLOPT_USERAGENT => 'Chiabeatslife-PurePhpDeployer/' . DEPLOY_VERSION,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
+            CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTPS,
+            CURLOPT_WRITEFUNCTION => static function ($handle, string $chunk) use (&$body, $maxBytes): int {
+                if (strlen($body) + strlen($chunk) > $maxBytes) {
+                    return 0;
+                }
+                $body .= $chunk;
+                return strlen($chunk);
+            },
+        ]);
+
+        $ok = curl_exec($curl);
+        $status = (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
+        $message = curl_error($curl);
+        curl_close($curl);
+
+        if ($ok !== false && $status >= 200 && $status < 300 && $body !== '') {
+            if (file_put_contents($destination, $body, LOCK_EX) === false) {
+                throw new RuntimeException('Impossibile salvare file GitHub: ' . basename($destination));
+            }
+            chmodSafe($destination, DEPLOY_FILE_MODE);
+            return;
+        }
+
+        $last = $message !== '' ? $message : 'HTTP ' . $status;
+        if (!in_array($status, [0, 408, 425, 429, 500, 502, 503, 504], true) || $attempt === 4) {
+            break;
+        }
+        usleep((int) (250_000 * (2 ** ($attempt - 1))));
+    }
+
+    throw new RuntimeException('Download raw GitHub fallito: ' . (string) $last);
+}
+
+function rawPath(string $path): string
+{
+    return implode('/', array_map('rawurlencode', explode('/', $path)));
+}
+
+function isSafeRepositoryPath(string $path): bool
+{
+    if ($path === '' || str_contains($path, "\0") || str_starts_with($path, '/') || str_contains($path, '\\')) {
+        return false;
+    }
+    foreach (explode('/', $path) as $part) {
+        if ($part === '' || $part === '.' || $part === '..') {
+            return false;
+        }
+    }
+    return true;
+}
+
 function downloadArchive(string $commit, string $destination): void
 {
     $url = 'https://codeload.github.com/' . DEPLOY_REPOSITORY . '/zip/' . $commit;
-    $lastError = 'errore sconosciuto';
+    $lastError = null;
 
-    for ($attempt = 1; $attempt <= 3; $attempt++) {
-        @unlink($destination);
+    for ($attempt = 1; $attempt <= 4; $attempt++) {
         $file = fopen($destination, 'wb');
         $curl = curl_init($url);
-
         if ($file === false || $curl === false) {
             if (is_resource($file)) {
                 fclose($file);
             }
-            throw new RuntimeException('Impossibile inizializzare il download GitHub.');
+            throw new RuntimeException('Impossibile inizializzare il fallback ZIP GitHub.');
         }
 
         $written = 0;
@@ -618,7 +817,7 @@ function downloadArchive(string $commit, string $destination): void
             CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_CONNECTTIMEOUT => 15,
             CURLOPT_TIMEOUT => 300,
-            CURLOPT_USERAGENT => 'Chiabeatslife-PurePhpDeployer/1.0',
+            CURLOPT_USERAGENT => 'Chiabeatslife-PurePhpDeployer/' . DEPLOY_VERSION,
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
             CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
@@ -627,7 +826,6 @@ function downloadArchive(string $commit, string $destination): void
                 if ($written + $length > DEPLOY_MAX_ARCHIVE_BYTES) {
                     return 0;
                 }
-
                 $result = fwrite($file, $chunk);
                 if ($result !== false) {
                     $written += $result;
@@ -647,17 +845,36 @@ function downloadArchive(string $commit, string $destination): void
             return;
         }
 
-        $lastError = $message !== '' ? $message : 'HTTP ' . $status;
         @unlink($destination);
-
-        if ($attempt < 3 && in_array($status, [429, 500, 502, 503, 504], true)) {
-            sleep($attempt * 2);
-            continue;
+        $lastError = $message !== '' ? $message : 'HTTP ' . $status;
+        if (!in_array($status, [0, 408, 425, 429, 500, 502, 503, 504], true) || $attempt === 4) {
+            break;
         }
-        break;
+        usleep((int) (300_000 * (2 ** ($attempt - 1))));
     }
 
-    throw new RuntimeException('Download GitHub fallito: ' . $lastError);
+    throw new RuntimeException('Download GitHub ZIP fallito: ' . (string) $lastError);
+}
+
+function httpRequestWithRetry(string $url, array $headers, int $timeout, int $maxBytes, int $attempts): array
+{
+    $last = null;
+    for ($attempt = 1; $attempt <= max(1, $attempts); $attempt++) {
+        try {
+            $response = httpRequest($url, $headers, $timeout, $maxBytes);
+            if (!in_array($response['status'], [408, 425, 429, 500, 502, 503, 504], true) || $attempt === $attempts) {
+                return $response;
+            }
+            $last = $response;
+        } catch (Throwable $exception) {
+            if ($attempt === $attempts) {
+                throw $exception;
+            }
+        }
+        usleep((int) (250_000 * (2 ** ($attempt - 1))));
+    }
+
+    return is_array($last) ? $last : ['status' => 0, 'body' => ''];
 }
 
 function httpRequest(string $url, array $headers, int $timeout, int $maxBytes): array
@@ -674,7 +891,7 @@ function httpRequest(string $url, array $headers, int $timeout, int $maxBytes): 
         CURLOPT_FOLLOWLOCATION => false,
         CURLOPT_CONNECTTIMEOUT => 15,
         CURLOPT_TIMEOUT => $timeout,
-        CURLOPT_USERAGENT => 'Chiabeatslife-PurePhpDeployer/1.0',
+        CURLOPT_USERAGENT => 'Chiabeatslife-PurePhpDeployer/' . DEPLOY_VERSION,
         CURLOPT_HTTPHEADER => $headers,
         CURLOPT_SSL_VERIFYPEER => true,
         CURLOPT_SSL_VERIFYHOST => 2,
@@ -724,7 +941,7 @@ function extractZipSafely(string $archive, string $destination): void
 
     if (!$zip->extractTo($destination)) {
         $zip->close();
-        throw new RuntimeException('Estrazione archivio fallita.');
+        throw new RuntimeException('Estrazione archivio GitHub fallita.');
     }
 
     $zip->close();
@@ -736,125 +953,26 @@ function locateSourceDirectory(string $extractDir): string
     if (count($matches) !== 1) {
         throw new RuntimeException('Root del repository non trovata univocamente nello ZIP GitHub.');
     }
-
     return $matches[0];
 }
 
 function validateSourceTree(string $sourceDir): void
 {
-    $requiredFiles = [
+    foreach ([
         '.htaccess',
-        '.env.example',
         'composer.json',
         'public/index.php',
-        'public/.htaccess',
         'bootstrap/app.php',
         'config/routes.php',
         'resources/views/layout.php',
         'src/Http/ApplicationFactory.php',
-        'storage/site-map.json',
-        'storage/migration-report.json',
-    ];
-
-    foreach ($requiredFiles as $path) {
+        'src/Http/PageAction.php',
+        'tools/import_wordpress.py',
+    ] as $path) {
         if (!is_file($sourceDir . '/' . $path)) {
-            throw new RuntimeException('Release GitHub incompleta: manca ' . $path . '. Esegui prima l’import del sito e committa gli snapshot.');
+            throw new RuntimeException('Release GitHub incompleta: manca ' . $path . '.');
         }
     }
-
-    if (!is_dir($sourceDir . '/storage/pages')) {
-        throw new RuntimeException('Release GitHub incompleta: manca storage/pages.');
-    }
-
-    verifyImportedSite($sourceDir);
-}
-
-function verifyImportedSite(string $releaseDir): array
-{
-    $report = readJsonFile($releaseDir . '/storage/migration-report.json');
-    $siteMap = readJsonFile($releaseDir . '/storage/site-map.json');
-
-    if ($report === null || $siteMap === null) {
-        throw new RuntimeException('Report/sitemap di migrazione non leggibili.');
-    }
-
-    $pages = (int) ($report['pages'] ?? 0);
-    $assets = (int) ($report['assets'] ?? 0);
-    $css = (int) ($report['css_assets'] ?? 0);
-    $js = (int) ($report['js_assets'] ?? 0);
-    $pageFailures = $report['page_failures'] ?? null;
-    $assetFailures = $report['asset_failures'] ?? null;
-
-    if ($pages < 1 || count($siteMap) < 1) {
-        throw new RuntimeException('Import non valido: nessuna pagina disponibile.');
-    }
-    if ($css < 1 || $js < 1) {
-        throw new RuntimeException('Import non valido: CSS o JavaScript legacy mancanti.');
-    }
-    if (!is_array($pageFailures) || $pageFailures !== []) {
-        throw new RuntimeException('Import non pubblicabile: sono presenti errori pagina nel migration-report.');
-    }
-    if (!is_array($assetFailures) || $assetFailures !== []) {
-        throw new RuntimeException('Import non pubblicabile: sono presenti errori asset nel migration-report.');
-    }
-
-    $snapshotFiles = glob($releaseDir . '/storage/pages/*.json') ?: [];
-    if (count($snapshotFiles) < $pages) {
-        throw new RuntimeException('Import non valido: il numero di snapshot è inferiore alle pagine dichiarate.');
-    }
-
-    foreach ($siteMap as $route) {
-        if (!is_array($route)) {
-            throw new RuntimeException('Sitemap interna non valida.');
-        }
-        $path = (string) ($route['path'] ?? '');
-        $page = (string) ($route['page'] ?? '');
-        if ($path === '' || $page === '' || !preg_match('/^[a-z0-9._-]+$/i', $page)) {
-            throw new RuntimeException('Route importata non valida.');
-        }
-        if (!is_file($releaseDir . '/storage/pages/' . $page . '.json')) {
-            throw new RuntimeException('Snapshot mancante per la route ' . $path . '.');
-        }
-    }
-
-    $runtimeDependencies = $report['runtime_dependencies'] ?? [];
-    if (!is_array($runtimeDependencies)) {
-        $runtimeDependencies = [];
-    }
-
-    return [
-        'pages' => $pages,
-        'assets' => $assets,
-        'css_assets' => $css,
-        'js_assets' => $js,
-        'runtime_dependencies' => array_keys($runtimeDependencies),
-    ];
-}
-
-function inspectMigrationReport(string $liveDir): array
-{
-    if (!is_file($liveDir . '/storage/migration-report.json')) {
-        return ['label' => 'non presenti'];
-    }
-
-    try {
-        $report = verifyImportedSite($liveDir);
-        return [
-            'label' => $report['pages'] . ' pagine · ' . $report['assets'] . ' asset',
-        ];
-    } catch (Throwable $exception) {
-        return ['label' => 'non validi'];
-    }
-}
-
-function hashOptionalFile(string $path): ?string
-{
-    if (!is_file($path)) {
-        return null;
-    }
-
-    $hash = hash_file('sha256', $path);
-    return is_string($hash) ? $hash : null;
 }
 
 function preserveRuntimeData(string $liveDir, string $releaseDir): array
@@ -862,13 +980,11 @@ function preserveRuntimeData(string $liveDir, string $releaseDir): array
     $preserved = [
         'env' => false,
         'vendor' => false,
+        'snapshots' => false,
     ];
 
     if (is_file($liveDir . '/.env')) {
-        if (!copy($liveDir . '/.env', $releaseDir . '/.env')) {
-            throw new RuntimeException('Impossibile conservare .env.');
-        }
-        chmodSafe($releaseDir . '/.env', DEPLOY_SECRET_MODE);
+        copyFileOrFail($liveDir . '/.env', $releaseDir . '/.env', DEPLOY_SECRET_MODE);
         $preserved['env'] = true;
     }
 
@@ -880,6 +996,241 @@ function preserveRuntimeData(string $liveDir, string $releaseDir): array
     return $preserved;
 }
 
+function preserveImportedSite(string $liveDir, string $releaseDir): void
+{
+    $sourcePages = $liveDir . '/storage/pages';
+    if (is_dir($sourcePages)) {
+        if (is_dir($releaseDir . '/storage/pages')) {
+            removeDirectory($releaseDir . '/storage/pages');
+        }
+        copyDirectory($sourcePages, $releaseDir . '/storage/pages');
+    }
+
+    foreach (['storage/site-map.json', 'storage/migration-report.json', 'config/routes.php'] as $relative) {
+        if (is_file($liveDir . '/' . $relative)) {
+            copyFileOrFail($liveDir . '/' . $relative, $releaseDir . '/' . $relative, DEPLOY_FILE_MODE);
+        }
+    }
+
+    $report = readJsonFile($liveDir . '/storage/migration-report.json');
+    if ($report !== null && isset($report['asset_manifest']) && is_array($report['asset_manifest'])) {
+        foreach ($report['asset_manifest'] as $asset) {
+            $publicPath = is_array($asset) ? (string) ($asset['public_path'] ?? '') : '';
+            if ($publicPath === '' || !str_starts_with($publicPath, '/') || str_contains($publicPath, '..')) {
+                continue;
+            }
+            $relative = ltrim($publicPath, '/');
+            if (is_file($liveDir . '/public/' . $relative)) {
+                copyFileOrFail($liveDir . '/public/' . $relative, $releaseDir . '/public/' . $relative, DEPLOY_FILE_MODE);
+            }
+        }
+    }
+}
+
+function prepareImportedSite(string $liveDir, string $releaseDir, string $stateDir, string $mode): array
+{
+    if ($mode === 'install') {
+        return runInitialImport($releaseDir, $stateDir);
+    }
+
+    try {
+        return verifyImportedSite($releaseDir);
+    } catch (Throwable) {
+        preserveImportedSite($liveDir, $releaseDir);
+        return verifyImportedSite($releaseDir);
+    }
+}
+
+function runInitialImport(string $releaseDir, string $stateDir): array
+{
+    if (!function_exists('proc_open')) {
+        throw new RuntimeException('Import iniziale impossibile: proc_open è disabilitato in PHP. Abilitalo in Plesk per questo dominio.');
+    }
+
+    $python = findPythonBinary($stateDir);
+    $command = [
+        $python,
+        $releaseDir . '/tools/import_wordpress.py',
+        '--base-url', DEPLOY_SOURCE_URL,
+        '--output', $releaseDir,
+        '--max-pages', (string) DEPLOY_IMPORT_MAX_PAGES,
+    ];
+
+    $result = runProcess($command, $releaseDir, $stateDir);
+    if ($result['exit_code'] !== 0) {
+        throw new RuntimeException(
+            "Import iniziale WordPress fallito.\n" . trim($result['stderr'] !== '' ? $result['stderr'] : $result['stdout'])
+        );
+    }
+
+    return verifyImportedSite($releaseDir);
+}
+
+function findPythonBinary(string $stateDir): string
+{
+    $configured = trim((string) getenv('DEPLOY_PYTHON_BIN'));
+    $candidates = array_values(array_unique(array_filter([$configured, 'python3', 'python'])));
+
+    foreach ($candidates as $candidate) {
+        try {
+            $result = runProcess([
+                $candidate,
+                '-c',
+                'import sys; print("%d.%d" % (sys.version_info[0], sys.version_info[1])); sys.exit(0 if sys.version_info >= (3, 6) else 2)',
+            ], null, $stateDir, [], 30);
+            if ($result['exit_code'] === 0) {
+                return $candidate;
+            }
+        } catch (Throwable) {
+        }
+    }
+
+    throw new RuntimeException('Python 3.6+ non disponibile sul server. Configura DEPLOY_PYTHON_BIN se Plesk lo espone con un percorso diverso.');
+}
+
+function runProcess(array $command, ?string $cwd, string $stateDir, array $env = [], int $timeout = 600): array
+{
+    $commandLine = implode(' ', array_map('escapeshellarg', $command));
+    $descriptors = [
+        0 => ['pipe', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ];
+
+    $environment = $env === [] ? null : array_merge($_ENV, $env);
+    $process = proc_open($commandLine, $descriptors, $pipes, $cwd, $environment);
+    if (!is_resource($process)) {
+        throw new RuntimeException('Impossibile avviare processo: ' . $command[0]);
+    }
+
+    fclose($pipes[0]);
+    stream_set_blocking($pipes[1], false);
+    stream_set_blocking($pipes[2], false);
+
+    $stdout = '';
+    $stderr = '';
+    $started = time();
+
+    while (true) {
+        $stdout .= (string) stream_get_contents($pipes[1]);
+        $stderr .= (string) stream_get_contents($pipes[2]);
+
+        $status = proc_get_status($process);
+        if (!($status['running'] ?? false)) {
+            break;
+        }
+        if (time() - $started > $timeout) {
+            proc_terminate($process, 9);
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+            proc_close($process);
+            throw new RuntimeException('Processo scaduto dopo ' . $timeout . ' secondi.');
+        }
+        usleep(100_000);
+    }
+
+    $stdout .= (string) stream_get_contents($pipes[1]);
+    $stderr .= (string) stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $exitCode = proc_close($process);
+
+    $stdout = substr($stdout, 0, 200_000);
+    $stderr = substr($stderr, 0, 200_000);
+
+    appendDeployLog($stateDir, [
+        'time' => gmdate(DATE_ATOM),
+        'result' => 'process',
+        'command' => basename((string) $command[0]),
+        'exit_code' => $exitCode,
+        'stdout' => sanitizeLogMessage($stdout),
+        'stderr' => sanitizeLogMessage($stderr),
+    ]);
+
+    return ['exit_code' => $exitCode, 'stdout' => $stdout, 'stderr' => $stderr];
+}
+
+function verifyImportedSite(string $releaseDir): array
+{
+    foreach (['storage/site-map.json', 'storage/migration-report.json', 'config/routes.php'] as $relative) {
+        if (!is_file($releaseDir . '/' . $relative)) {
+            throw new RuntimeException('Import incompleto: manca ' . $relative . '.');
+        }
+    }
+
+    $report = readJsonFile($releaseDir . '/storage/migration-report.json');
+    if ($report === null) {
+        throw new RuntimeException('Import incompleto: migration-report.json non è leggibile.');
+    }
+
+    $pages = (int) ($report['pages'] ?? 0);
+    $assets = (int) ($report['assets'] ?? 0);
+    $css = (int) ($report['css_assets'] ?? 0);
+    $js = (int) ($report['js_assets'] ?? 0);
+    $pageFailures = is_array($report['page_failures'] ?? null) ? count($report['page_failures']) : 0;
+    $assetFailures = is_array($report['asset_failures'] ?? null) ? count($report['asset_failures']) : 0;
+    $snapshotFiles = glob($releaseDir . '/storage/pages/*.json') ?: [];
+
+    if ($pages < 1 || count($snapshotFiles) < $pages) {
+        throw new RuntimeException('Import incompleto: snapshot pagine insufficienti.');
+    }
+    if ($assets < 1 || $css < 1 || $js < 1) {
+        throw new RuntimeException('Import incompleto: CSS/JS/asset non risultano acquisiti.');
+    }
+    if ($pageFailures > 0 || $assetFailures > 0) {
+        throw new RuntimeException('Import incompleto: ' . $pageFailures . ' errori pagina e ' . $assetFailures . ' errori asset.');
+    }
+
+    return [
+        'pages' => $pages,
+        'assets' => $assets,
+        'css_assets' => $css,
+        'js_assets' => $js,
+        'page_failures' => $pageFailures,
+        'asset_failures' => $assetFailures,
+    ];
+}
+
+function inspectMigrationReport(string $liveDir): array
+{
+    $report = readJsonFile($liveDir . '/storage/migration-report.json');
+    if ($report === null) {
+        return ['label' => 'non generati'];
+    }
+    return [
+        'label' => (int) ($report['pages'] ?? 0) . ' pagine · ' . (int) ($report['assets'] ?? 0) . ' asset',
+    ];
+}
+
+function fixReleasePermissions(string $releaseDir): void
+{
+    chmodSafe($releaseDir, DEPLOY_DIR_MODE);
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($releaseDir, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::SELF_FIRST
+    );
+
+    foreach ($iterator as $item) {
+        if ($item->isLink()) {
+            throw new RuntimeException('La release contiene un link simbolico non consentito.');
+        }
+        $relative = str_replace('\\', '/', $iterator->getSubPathName());
+        $mode = $item->isDir() ? DEPLOY_DIR_MODE : ($relative === '.env' ? DEPLOY_SECRET_MODE : DEPLOY_FILE_MODE);
+        chmodSafe($item->getPathname(), $mode);
+    }
+}
+
+function verifyRelease(string $releaseDir): array
+{
+    foreach (['.htaccess', '.env', 'public/index.php', 'bootstrap/app.php', 'config/routes.php', 'storage/migration-report.json'] as $relative) {
+        if (!is_readable($releaseDir . '/' . $relative)) {
+            throw new RuntimeException('File non leggibile dopo il deploy: ' . $relative);
+        }
+    }
+
+    return verifyImportedSite($releaseDir);
+}
+
 function installMaintenanceRouter(string $documentRoot, string $stateDir): void
 {
     backupRootHtaccess($documentRoot, $stateDir);
@@ -888,9 +1239,7 @@ function installMaintenanceRouter(string $documentRoot, string $stateDir): void
     $maintenanceFile = $documentRoot . '/' . DEPLOY_MAINTENANCE_FILE;
     $installer = preg_quote(basename((string) ($_SERVER['SCRIPT_NAME'] ?? '/deploy.php')), '~');
     $maintenanceName = preg_quote(DEPLOY_MAINTENANCE_FILE, '~');
-
-    $html = '<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Manutenzione</title></head><body style="font-family:system-ui;padding:40px;max-width:720px;margin:auto"><h1>Chiabeatslife</h1><p>Aggiornamento in corso. Riprova tra poco.</p></body></html>';
-
+    $html = '<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Chiabeatslife · Manutenzione</title></head><body style="font-family:system-ui;padding:40px;max-width:720px;margin:auto"><h1>Chiabeatslife</h1><p>Aggiornamento in corso. Riprova tra poco.</p></body></html>';
     if (file_put_contents($maintenanceFile, $html, LOCK_EX) === false) {
         throw new RuntimeException('Impossibile creare la pagina di manutenzione.');
     }
@@ -997,10 +1346,12 @@ function switchRelease(string $liveDir, string $releaseDir, string $stateDir, st
 
 function checkHealth(): array
 {
+    $url = rtrim(deployTargetUrl(), '/') . DEPLOY_HEALTH_PATH;
+
     try {
         $response = httpRequest(
-            rtrim(DEPLOY_APP_URL, '/') . DEPLOY_HEALTH_PATH,
-            ['Accept: application/json'],
+            $url,
+            ['Accept: application/json', 'Cache-Control: no-cache'],
             20,
             1_000_000
         );
@@ -1012,11 +1363,15 @@ function checkHealth(): array
         return [
             'ok' => $statusOk && $payloadOk,
             'status' => $response['status'],
+            'url' => $url,
+            'body' => substr(trim(strip_tags((string) $response['body'])), 0, 800),
         ];
     } catch (Throwable $exception) {
         return [
             'ok' => false,
             'status' => null,
+            'url' => $url,
+            'body' => '',
             'message' => sanitizeLogMessage($exception->getMessage()),
         ];
     }
@@ -1051,45 +1406,13 @@ function copyDirectory(string $source, string $destination): void
     }
 }
 
-function fixReleasePermissions(string $releaseDir): void
+function copyFileOrFail(string $source, string $destination, int $mode): void
 {
-    chmodSafe($releaseDir, DEPLOY_DIR_MODE);
-
-    $iterator = new RecursiveIteratorIterator(
-        new RecursiveDirectoryIterator($releaseDir, FilesystemIterator::SKIP_DOTS),
-        RecursiveIteratorIterator::SELF_FIRST
-    );
-
-    foreach ($iterator as $item) {
-        if ($item->isLink()) {
-            throw new RuntimeException('La release contiene un link simbolico non consentito.');
-        }
-
-        $relative = str_replace('\\', '/', $iterator->getSubPathName());
-        $mode = $item->isDir() ? DEPLOY_DIR_MODE : ($relative === '.env' ? DEPLOY_SECRET_MODE : DEPLOY_FILE_MODE);
-        chmodSafe($item->getPathname(), $mode);
+    mkdirOrFail(dirname($destination), DEPLOY_DIR_MODE);
+    if (!copy($source, $destination)) {
+        throw new RuntimeException('Copia file fallita: ' . basename($source));
     }
-}
-
-function verifyRelease(string $releaseDir): array
-{
-    foreach ([
-        '.htaccess',
-        '.env',
-        'composer.json',
-        'public/index.php',
-        'public/.htaccess',
-        'bootstrap/app.php',
-        'config/routes.php',
-        'storage/site-map.json',
-        'storage/migration-report.json',
-    ] as $relative) {
-        if (!is_readable($releaseDir . '/' . $relative)) {
-            throw new RuntimeException('File non leggibile dopo il deploy: ' . $relative);
-        }
-    }
-
-    return verifyImportedSite($releaseDir);
+    chmodSafe($destination, $mode);
 }
 
 function mkdirOrFail(string $path, int $mode): void
@@ -1162,7 +1485,7 @@ function writeJsonFile(string $file, array $data, int $mode = DEPLOY_SECRET_MODE
     $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n";
 
     if (file_put_contents($file, $json, LOCK_EX) === false) {
-        throw new RuntimeException('Impossibile scrivere il file di stato.');
+        throw new RuntimeException('Impossibile scrivere file JSON.');
     }
 
     chmodSafe($file, $mode);
@@ -1178,9 +1501,24 @@ function appendDeployLog(string $stateDir, array $entry): void
     }
 }
 
+function appendDeployDiagnostic(string $workDir, string $message): void
+{
+    @file_put_contents($workDir . '/download-diagnostic.log', gmdate(DATE_ATOM) . ' ' . $message . "\n", FILE_APPEND | LOCK_EX);
+}
+
+function readTextFileSafe(string $path): string
+{
+    if (!is_file($path)) {
+        return '';
+    }
+    $content = file_get_contents($path);
+    return is_string($content) ? substr($content, 0, 2000) : '';
+}
+
 function sanitizeLogMessage(string $message): string
 {
-    return substr($message, 0, 500);
+    $message = preg_replace('/\s+/', ' ', $message) ?? $message;
+    return substr($message, 0, 1000);
 }
 
 function clientIp(): string
@@ -1191,41 +1529,40 @@ function clientIp(): string
 function renderResult(array $result): string
 {
     $awaiting = (bool) ($result['awaiting_composer'] ?? false);
-    $health = $result['health'] ?? [];
-    $preserved = $result['preserved'] ?? [];
-    $migration = $result['migration'] ?? [];
+    $health = is_array($result['health'] ?? null) ? $result['health'] : [];
+    $migration = is_array($result['migration'] ?? null) ? $result['migration'] : [];
+    $preserved = is_array($result['preserved'] ?? null) ? $result['preserved'] : [];
+
+    $migrationText = isset($migration['pages'])
+        ? e((string) $migration['pages']) . ' pagine · ' . e((string) ($migration['assets'] ?? 0)) . ' asset · '
+            . e((string) ($migration['css_assets'] ?? 0)) . ' CSS · ' . e((string) ($migration['js_assets'] ?? 0)) . ' JS'
+        : 'non disponibile';
 
     if ($awaiting) {
         return '<div class="alert warning"><strong>Release preparata. Il sito è in manutenzione.</strong><br>'
             . 'Commit: <code>' . e((string) ($result['commit'] ?? '')) . '</code><br>'
-            . 'Snapshot: ' . e((string) ($migration['pages'] ?? '?')) . ' pagine · '
-            . e((string) ($migration['assets'] ?? '?')) . ' asset.<br>'
-            . (!empty($result['composer_changed']) ? '<strong>Il manifest Composer è cambiato.</strong><br>' : '')
-            . 'In Plesk → Composer usa <code>/' . e(DEPLOY_LIVE_DIR) . '</code>, esegui <strong>Installa/Aggiorna</strong>, poi torna qui e premi <strong>Completa pubblicazione</strong>.</div>';
+            . 'Import: <code>' . $migrationText . '</code><br>'
+            . (!empty($result['composer_changed']) ? '<strong>composer.json/composer.lock sono cambiati.</strong><br>' : '')
+            . 'In Plesk → Composer usa <code>/' . e(DEPLOY_LIVE_DIR) . '</code>, esegui Installa/Aggiorna e poi torna qui con <strong>COMPLETA</strong>.</div>';
     }
 
     $healthText = ($health['ok'] ?? false)
         ? 'Health check Slim riuscito (HTTP ' . e((string) $health['status']) . ').'
-        : 'Health check non eseguito o non riuscito.';
+        : 'Health check non disponibile.';
 
     return '<div class="alert success"><strong>Deploy completato.</strong><br>'
         . 'Commit: <code>' . e((string) ($result['commit'] ?? '')) . '</code><br>'
-        . 'Snapshot: ' . e((string) ($migration['pages'] ?? '?')) . ' pagine · '
-        . e((string) ($migration['assets'] ?? '?')) . ' asset · '
-        . e((string) ($migration['css_assets'] ?? '?')) . ' CSS · '
-        . e((string) ($migration['js_assets'] ?? '?')) . ' JS.<br>'
-        . (!empty($preserved['env']) ? '.env conservato.<br>' : '')
-        . (!empty($preserved['vendor']) ? 'vendor conservato.<br>' : '')
+        . 'Import: <code>' . $migrationText . '</code><br>'
         . e($healthText)
+        . (!empty($preserved['env']) ? '<br>.env conservato.' : '')
+        . (!empty($preserved['vendor']) ? '<br>vendor conservato.' : '')
         . '</div>';
 }
 
-function field(string $label, string $name, string $type = 'text', string $value = '', bool $required = false, string $extra = ''): string
+function field(string $label, string $name, string $type, string $value = '', bool $required = false, string $extra = ''): string
 {
-    $requiredAttribute = $required ? ' required' : '';
-    $valueAttribute = $type === 'password' ? '' : ' value="' . e($value) . '"';
-
-    return '<label><span>' . e($label) . '</span><input type="' . e($type) . '" name="' . e($name) . '"' . $valueAttribute . $requiredAttribute . ' ' . $extra . '></label>';
+    return '<label><span>' . e($label) . '</span><input type="' . e($type) . '" name="' . e($name) . '" value="' . e($value) . '" '
+        . ($required ? 'required ' : '') . $extra . '></label>';
 }
 
 function e(string $value): string
@@ -1237,6 +1574,6 @@ function renderPage(string $title, string $body): void
 {
     echo '<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
         . '<title>' . e($title) . '</title><style>'
-        . ':root{font-family:Inter,system-ui,sans-serif;color:#172019;background:#eef1ec;color-scheme:light}*{box-sizing:border-box}body{margin:0;padding:24px}code{overflow-wrap:anywhere}h1{margin-top:0}.card{max-width:560px;margin:5vh auto;background:#fff;padding:28px;border-radius:18px;box-shadow:0 14px 45px #173d2b18}.wide{max-width:900px;margin:24px auto}.topbar{max-width:900px;margin:auto;display:flex;justify-content:space-between;align-items:center}.topbar small{display:block;color:#647269;margin-top:4px}.inline{margin:0}fieldset{border:1px solid #d9dfd7;border-radius:14px;padding:18px;margin:20px 0}legend{font-weight:750;padding:0 8px}label{display:block;margin:13px 0}label span{display:block;font-weight:650;margin-bottom:7px}input{width:100%;border:1px solid #b9c4ba;border-radius:10px;padding:11px 12px;font:inherit;background:#fff}button{border:0;border-radius:10px;padding:12px 18px;background:#173d2b;color:#fff;font-weight:750;cursor:pointer}.secondary{background:#dfe6df;color:#173d2b}.alert{padding:14px 16px;border-radius:12px;margin:16px 0}.error{background:#ffe8e5;color:#7a1b10}.success{background:#e3f5e8;color:#174d28}.warning{background:#fff2cc;color:#6a4c00}.info{background:#e7eef8;color:#1f426d}.status{display:grid;grid-template-columns:140px 1fr;gap:7px 14px;background:#f3f5f1;padding:14px;border-radius:12px}.status span{color:#647269}@media(max-width:700px){body{padding:12px}.card{padding:20px}.status{grid-template-columns:1fr}.topbar{align-items:flex-start}}'
-        . '</style></head><body>' . $body . '</body></html>';
+        . ':root{color-scheme:light;--bg:#f5f2ed;--card:#fff;--ink:#1d1d1f;--muted:#6c6964;--accent:#342c27;--border:#ddd6ce;--error:#8b1e1e;--warn:#805b00;--ok:#24643a}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.5}.shell{max-width:920px;margin:0 auto;padding:42px 20px 80px}.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;gap:20px}.topbar strong{display:block;font-size:1.1rem}.topbar small{color:var(--muted)}.card{max-width:620px;margin:40px auto;background:var(--card);border:1px solid var(--border);border-radius:20px;padding:28px;box-shadow:0 12px 34px rgba(35,28,23,.07)}.card.wide{max-width:none;margin:0}.card h1{margin-top:0;font-size:1.75rem}.alert{padding:14px 16px;border-radius:12px;margin:18px 0;background:#f3f1ef;border:1px solid var(--border)}.alert.error{color:var(--error);background:#fff4f4;border-color:#e9c1c1}.alert.warning{color:#5e4200;background:#fff8e4;border-color:#ecd89c}.alert.success{color:#174728;background:#edf8f0;border-color:#b9dfc4}.alert.info{background:#f1f5f8;border-color:#cad8e2}.status{display:grid;grid-template-columns:minmax(140px,.6fr) minmax(0,1.4fr);gap:9px 16px;padding:14px 0 20px}.status span{color:var(--muted)}code{overflow-wrap:anywhere}fieldset{border:1px solid var(--border);border-radius:14px;padding:18px;margin:18px 0}legend{padding:0 8px;font-weight:700}label{display:grid;gap:7px;margin:14px 0}input{width:100%;padding:12px 13px;border:1px solid #c9c1b9;border-radius:10px;background:#fff;font:inherit}button{appearance:none;border:0;border-radius:10px;background:var(--accent);color:#fff;padding:12px 17px;font-weight:700;cursor:pointer}button.secondary{background:#766c65}.inline{margin:0}.inline button{padding:9px 13px}@media(max-width:600px){.shell{padding:22px 14px 60px}.topbar{align-items:flex-start}.status{grid-template-columns:1fr}.card{padding:20px;border-radius:14px}}'
+        . '</style></head><body><main class="shell">' . $body . '</main></body></html>';
 }
