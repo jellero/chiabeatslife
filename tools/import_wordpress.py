@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Importa il frontend pubblico WordPress in snapshot servibili da Slim 4.
+"""Importa il frontend pubblico WordPress di Chiabeatslife in snapshot Slim 4.
 
-Compatibile con Python 3.6+ e privo di dipendenze Python esterne.
-CSS e JavaScript vengono salvati byte-per-byte nel loro path pubblico originale.
+Obiettivi:
+- Python 3.6+ e sola standard library;
+- conserva il frontend e gli asset necessari;
+- localizza URL interni e asset del dominio storico chiabeatslife.com;
+- evita dipendenze runtime WordPress non necessarie e riferimenti RPC estranei;
+- genera config/routes.php, storage/site-map.json e migration-report.json.
 """
 
 import argparse
@@ -24,10 +28,16 @@ from urllib.request import Request, urlopen
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 "
-    "ChiabeatslifeMigration/2.0"
+    "ChiabeatslifeMigration/3.0"
 )
 PAGE_LIMIT = 1200
 ASSET_LIMIT_BYTES = 95 * 1024 * 1024
+BRAND_ASSET_HOSTS = {"chiabeatslife.com", "www.chiabeatslife.com"}
+BLOCKED_RUNTIME_HOSTS = {
+    "polygon-public.nodies.app",
+    "polygon-pokt.nodies.app",
+    "polygon.rpc.subquery.network",
+}
 STATIC_EXTENSIONS = {
     ".css", ".js", ".mjs", ".map", ".json", ".xml", ".txt",
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".avif",
@@ -50,6 +60,7 @@ RUNTIME_MARKERS = {
 CSS_URL_RE = re.compile(r"url\(\s*(['\"]?)([^)'\"]+)\1\s*\)", re.I)
 CSS_IMPORT_RE = re.compile(r"@import\s+(?:url\()?\s*(['\"])([^'\"]+)\1\s*\)?", re.I)
 ABSOLUTE_URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.I)
+PROTOCOL_RELATIVE_URL_RE = re.compile(r"(?<!:)//[A-Za-z0-9.-]+(?::[0-9]+)?/[^\s'\"<>]*", re.I)
 TITLE_RE = re.compile(r"<title\b[^>]*>(.*?)</title\s*>", re.I | re.S)
 HEAD_RE = re.compile(r"<head\b[^>]*>(.*?)</head\s*>", re.I | re.S)
 BODY_RE = re.compile(r"<body\b([^>]*)>(.*?)</body\s*>", re.I | re.S)
@@ -59,6 +70,7 @@ META_GENERATOR_RE = re.compile(
 )
 META_CHARSET_RE = re.compile(r"<meta\b[^>]*\bcharset\s*=[^>]*>\s*", re.I | re.S)
 LINK_TAG_RE = re.compile(r"<link\b[^>]*>\s*", re.I | re.S)
+SCRIPT_TAG_RE = re.compile(r"<script\b[^>]*>.*?</script\s*>\s*", re.I | re.S)
 TITLE_TAG_RE = re.compile(r"<title\b[^>]*>.*?</title\s*>\s*", re.I | re.S)
 TAG_RE = re.compile(r"<[^>]+>")
 
@@ -227,6 +239,8 @@ class Importer(object):
         self.scheme = parsed.scheme
         self.netloc = parsed.netloc
         self.hostname = (parsed.hostname or "").lower()
+        self.localizable_hosts = set(BRAND_ASSET_HOSTS)
+        self.localizable_hosts.add(self.hostname)
         self.output = output.resolve()
         self.public_dir = self.output / "public"
         self.pages_dir = self.output / "storage" / "pages"
@@ -237,9 +251,17 @@ class Importer(object):
         self.page_failures = []
         self.external_asset_hosts = set()
         self.runtime_dependencies = {}
+        self.removed_runtime_hosts = set()
         self._asset_in_progress = set()
         self._queued_pages = set()
         self.ssl_context = ssl.create_default_context()
+
+    @staticmethod
+    def is_blocked_host(host):
+        host = (host or "").lower()
+        if host in BLOCKED_RUNTIME_HOSTS:
+            return True
+        return host.endswith(".nodies.app") or host.endswith(".subquery.network")
 
     def http_get(self, url, timeout=40, max_bytes=None, attempts=4):
         last_error = None
@@ -390,8 +412,10 @@ class Importer(object):
                 self.discover_css_references(style_text, response.url)
 
             for match in ABSOLUTE_URL_RE.findall(text):
-                if self.hostname in match:
-                    self.consider_asset(match.rstrip("\\),]}"), response.url, False)
+                candidate = match.rstrip("\\),]}")
+                parsed = urlsplit(candidate)
+                if (parsed.hostname or "").lower() in self.localizable_hosts:
+                    self.consider_asset(candidate, response.url, False)
 
             self.record_runtime_dependencies(text, collector, canonical_page_url)
             snapshot = self.build_snapshot(text, collector, canonical_page_url)
@@ -421,6 +445,66 @@ class Importer(object):
             return None
         return urlunsplit((self.scheme, self.netloc, path, "", ""))
 
+    def local_public_url(self, absolute_url):
+        try:
+            parsed = urlsplit(absolute_url)
+        except ValueError:
+            return absolute_url
+        host = (parsed.hostname or "").lower()
+        if host not in self.localizable_hosts:
+            return absolute_url
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        if parsed.fragment:
+            path += "#" + parsed.fragment
+        return path
+
+    def rewrite_local_urls(self, value):
+        def replace_absolute(match):
+            return self.local_public_url(match.group(0))
+
+        def replace_protocol_relative(match):
+            raw = match.group(0)
+            return self.local_public_url("https:" + raw)
+
+        value = ABSOLUTE_URL_RE.sub(replace_absolute, value)
+        value = PROTOCOL_RELATIVE_URL_RE.sub(replace_protocol_relative, value)
+        for host in self.localizable_hosts:
+            value = value.replace("https:\\/\\/" + host, "")
+            value = value.replace("http:\\/\\/" + host, "")
+        return value
+
+    def strip_blocked_runtime(self, value):
+        def filter_script(match):
+            tag = match.group(0)
+            lower = tag.lower()
+            for host in BLOCKED_RUNTIME_HOSTS:
+                if host in lower:
+                    self.removed_runtime_hosts.add(host)
+                    return ""
+            if ".nodies.app" in lower:
+                self.removed_runtime_hosts.add("*.nodies.app")
+                return ""
+            if ".subquery.network" in lower:
+                self.removed_runtime_hosts.add("*.subquery.network")
+                return ""
+            return tag
+
+        def filter_link(match):
+            tag = match.group(0)
+            lower = tag.lower()
+            for host in BLOCKED_RUNTIME_HOSTS:
+                if host in lower:
+                    self.removed_runtime_hosts.add(host)
+                    return ""
+            if ".nodies.app" in lower or ".subquery.network" in lower:
+                self.removed_runtime_hosts.add("rpc-runtime")
+                return ""
+            return tag
+
+        return LINK_TAG_RE.sub(filter_link, SCRIPT_TAG_RE.sub(filter_script, value))
+
     def consider_asset(self, raw_url, document_url, forced=False):
         raw_url = str(raw_url).strip()
         if not raw_url or raw_url.startswith(
@@ -432,6 +516,9 @@ class Importer(object):
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             return
         host = (parsed.hostname or "").lower()
+        if self.is_blocked_host(host):
+            self.removed_runtime_hosts.add(host)
+            return
         suffix = Path(unquote(parsed.path)).suffix.lower()
         is_asset = (
             forced or suffix in STATIC_EXTENSIONS
@@ -439,7 +526,7 @@ class Importer(object):
         )
         if not is_asset:
             return
-        if host != self.hostname:
+        if host not in self.localizable_hosts:
             self.external_asset_hosts.add(host)
             return
         self.mirror_asset(absolute)
@@ -472,19 +559,23 @@ class Importer(object):
                 self.asset_failures.append(FailureRecord(url, "risposta HTML inattesa per asset"))
                 return None
 
+            content = response.content
+            if suffix == ".css" or "text/css" in ctype.lower():
+                css = self.decode_bytes(content, ctype)
+                self.discover_css_references(css, key)
+                css = self.rewrite_local_urls(css)
+                content = css.encode("utf-8")
+
             local_path.parent.mkdir(parents=True, exist_ok=True)
-            local_path.write_bytes(response.content)
+            local_path.write_bytes(content)
             record = AssetRecord(
                 key,
                 public_url,
-                len(response.content),
-                hashlib.sha256(response.content).hexdigest(),
+                len(content),
+                hashlib.sha256(content).hexdigest(),
                 ctype.split(";", 1)[0].strip(),
             )
             self.assets[key] = record
-            if suffix == ".css" or "text/css" in ctype.lower():
-                css = self.decode_bytes(response.content, ctype)
-                self.discover_css_references(css, key)
             return public_url
         finally:
             self._asset_in_progress.discard(key)
@@ -531,8 +622,7 @@ class Importer(object):
             return {}
         return parser.attrs or {}
 
-    @staticmethod
-    def clean_head(head_html):
+    def clean_head(self, head_html):
         value = TITLE_TAG_RE.sub("", head_html)
         value = META_CHARSET_RE.sub("", value)
         value = META_GENERATOR_RE.sub("", value)
@@ -548,9 +638,17 @@ class Importer(object):
                 "application/json+oembed", "text/xml+oembed",
                 "application/rss+xml", "application/atom+xml",
             )
-            return "" if any(item in lower for item in blocked) else tag
+            if any(item in lower for item in blocked):
+                return ""
+            for host in BLOCKED_RUNTIME_HOSTS:
+                if host in lower:
+                    self.removed_runtime_hosts.add(host)
+                    return ""
+            return tag
 
-        return LINK_TAG_RE.sub(filter_link, value)
+        value = LINK_TAG_RE.sub(filter_link, value)
+        value = self.strip_blocked_runtime(value)
+        return self.rewrite_local_urls(value)
 
     def build_snapshot(self, text, collector, source_url):
         title_match = TITLE_RE.search(text)
@@ -569,6 +667,9 @@ class Importer(object):
         else:
             body_attrs = dict(collector.body_attrs)
             body_html = text
+
+        body_html = self.strip_blocked_runtime(body_html)
+        body_html = self.rewrite_local_urls(body_html)
 
         html_match = HTML_RE.search(text)
         if html_match:
@@ -598,6 +699,9 @@ class Importer(object):
         for marker, label in RUNTIME_MARKERS.items():
             if marker.lower() in lower:
                 self.runtime_dependencies.setdefault(label, set()).add(page_url)
+        for host in BLOCKED_RUNTIME_HOSTS:
+            if host in lower:
+                self.removed_runtime_hosts.add(host)
         for action in collector.form_actions:
             absolute = urljoin(page_url, action)
             parsed = urlsplit(absolute)
@@ -683,9 +787,11 @@ class Importer(object):
                 1 for r in self.assets.values()
                 if r.public_path.lower().endswith((".js", ".mjs"))
             ),
+            "localized_hosts": sorted(self.localizable_hosts),
             "external_asset_hosts": sorted(
                 host for host in self.external_asset_hosts if host
             ),
+            "removed_runtime_hosts": sorted(self.removed_runtime_hosts),
             "runtime_dependencies": {
                 key: sorted(value)
                 for key, value in sorted(self.runtime_dependencies.items())
@@ -711,6 +817,8 @@ class Importer(object):
         print("  Asset: {}".format(len(self.assets)))
         print("  Errori pagina: {}".format(len(self.page_failures)))
         print("  Errori asset: {}".format(len(self.asset_failures)))
+        if self.removed_runtime_hosts:
+            print("  Runtime estranei rimossi: {}".format(", ".join(sorted(self.removed_runtime_hosts))))
         if self.runtime_dependencies:
             print("  Riferimenti WordPress residui rilevati:")
             for label, urls in sorted(self.runtime_dependencies.items()):
