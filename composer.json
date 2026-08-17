@@ -1,0 +1,35 @@
+{
+  "name": "jellero/chiabeatslife",
+  "description": "Chiabeatslife: sito pubblico ricostruito su Slim 4 a partire dal frontend esistente.",
+  "type": "project",
+  "license": "proprietary",
+  "require": {
+    "php": "^8.3 || ^8.4",
+    "slim/psr7": "^1.7",
+    "slim/slim": "^4.15"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^11.5"
+  },
+  "autoload": {
+    "psr-4": {
+      "Chiabeatslife\\": "src/"
+    }
+  },
+  "scripts": {
+    "lint": "find bootstrap config public resources src tests tools -type f -name '*.php' -print0 | xargs -0 -n1 php -l",
+    "smoke": "php tests/smoke.php",
+    "check": [
+      "@lint",
+      "@smoke"
+    ]
+  },
+  "config": {
+    "allow-plugins": {},
+    "optimize-autoloader": true,
+    "sort-packages": true,
+    "platform": {
+      "php": "8.3.0"
+    }
+  }
+}
