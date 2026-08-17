@@ -1,26 +1,20 @@
 #!/usr/bin/env python3
 """Importa il frontend pubblico WordPress in uno snapshot servibile da Slim 4.
 
+Compatibile con Python 3.6+.
 Il crawler conserva CSS e JavaScript byte-per-byte nel loro path pubblico originale,
 ricostruisce una shell HTML indipendente da WordPress e genera un inventario di route.
-È pensato per una migrazione una tantum e può essere rilanciato in modo idempotente.
 """
-
-from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-import os
 import re
-import shutil
 import sys
 import time
 import xml.etree.ElementTree as ET
 from collections import deque
-from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Iterable
 from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
 import requests
@@ -31,7 +25,7 @@ from urllib3.util.retry import Retry
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 "
-    "ChiabeatslifeMigration/1.0"
+    "ChiabeatslifeMigration/1.1"
 )
 
 PAGE_LIMIT = 1200
@@ -64,23 +58,35 @@ CSS_IMPORT_RE = re.compile(r"@import\s+(?:url\()?\s*(['\"])([^'\"]+)\1\s*\)?", r
 ABSOLUTE_URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
 
 
-@dataclass
-class AssetRecord:
-    source_url: str
-    public_path: str
-    size: int
-    sha256: str
-    content_type: str
+class AssetRecord(object):
+    def __init__(self, source_url, public_path, size, sha256, content_type):
+        self.source_url = source_url
+        self.public_path = public_path
+        self.size = size
+        self.sha256 = sha256
+        self.content_type = content_type
+
+    def to_dict(self):
+        return {
+            "source_url": self.source_url,
+            "public_path": self.public_path,
+            "size": self.size,
+            "sha256": self.sha256,
+            "content_type": self.content_type,
+        }
 
 
-@dataclass
-class FailureRecord:
-    url: str
-    reason: str
+class FailureRecord(object):
+    def __init__(self, url, reason):
+        self.url = url
+        self.reason = reason
+
+    def to_dict(self):
+        return {"url": self.url, "reason": self.reason}
 
 
-class Importer:
-    def __init__(self, base_url: str, output: Path, max_pages: int = PAGE_LIMIT) -> None:
+class Importer(object):
+    def __init__(self, base_url, output, max_pages=PAGE_LIMIT):
         parsed = urlsplit(base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("base-url non valido")
@@ -100,23 +106,25 @@ class Importer:
             read=3,
             backoff_factor=0.6,
             status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset({"GET", "HEAD"}),
         )
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "it-IT,it;q=0.9,en;q=0.6"})
+        self.session.headers.update({
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "it-IT,it;q=0.9,en;q=0.6",
+        })
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
         self.session.mount("http://", HTTPAdapter(max_retries=retry))
 
-        self.pages: dict[str, dict] = {}
-        self.assets: dict[str, AssetRecord] = {}
-        self.asset_failures: list[FailureRecord] = []
-        self.page_failures: list[FailureRecord] = []
-        self.external_asset_hosts: set[str] = set()
-        self.runtime_dependencies: dict[str, set[str]] = {}
-        self._asset_in_progress: set[str] = set()
-        self._queued_pages: set[str] = set()
+        self.pages = {}
+        self.assets = {}
+        self.asset_failures = []
+        self.page_failures = []
+        self.external_asset_hosts = set()
+        self.runtime_dependencies = {}
+        self._asset_in_progress = set()
+        self._queued_pages = set()
 
-    def run(self) -> None:
+    def run(self):
         self.prepare_output()
         seeds = self.discover_seed_urls()
         self.crawl_pages(seeds)
@@ -128,14 +136,13 @@ class Importer:
         if not self.pages:
             raise RuntimeError("Nessuna pagina HTML è stata importata dal sito sorgente")
 
-    def prepare_output(self) -> None:
+    def prepare_output(self):
         self.pages_dir.mkdir(parents=True, exist_ok=True)
-        # Le pagine sono rigenerate integralmente; gli asset invece sono aggiornati in-place.
         for old in self.pages_dir.glob("*.json"):
             old.unlink()
 
-    def discover_seed_urls(self) -> list[str]:
-        seeds: set[str] = {self.base_url}
+    def discover_seed_urls(self):
+        seeds = {self.base_url}
         sitemap_candidates = {
             urljoin(self.base_url, "wp-sitemap.xml"),
             urljoin(self.base_url, "sitemap_index.xml"),
@@ -146,16 +153,20 @@ class Importer:
         try:
             response = self.session.get(robots_url, timeout=25)
             if response.ok:
-                self._save_plain_public_file(robots_url, response.content, response.headers.get("Content-Type", "text/plain"))
+                self._save_plain_public_file(
+                    robots_url,
+                    response.content,
+                    response.headers.get("Content-Type", "text/plain"),
+                )
                 for line in response.text.splitlines():
                     if line.lower().startswith("sitemap:"):
                         candidate = line.split(":", 1)[1].strip()
                         if candidate:
                             sitemap_candidates.add(candidate)
         except requests.RequestException as exc:
-            self.asset_failures.append(FailureRecord(robots_url, f"robots: {exc}"))
+            self.asset_failures.append(FailureRecord(robots_url, "robots: {}".format(exc)))
 
-        visited_sitemaps: set[str] = set()
+        visited_sitemaps = set()
         queue = deque(sorted(sitemap_candidates))
         while queue and len(visited_sitemaps) < 100:
             sitemap_url = queue.popleft()
@@ -187,24 +198,24 @@ class Importer:
                 if page_url:
                     seeds.add(page_url)
 
-        print(f"Seed URL individuati: {len(seeds)}")
+        print("Seed URL individuati: {}".format(len(seeds)))
         return sorted(seeds)
 
-    def crawl_pages(self, seeds: Iterable[str]) -> None:
-        queue: deque[str] = deque()
+    def crawl_pages(self, seeds):
+        queue = deque()
         for seed in seeds:
             normalized = self.normalize_page_url(seed)
             if normalized and normalized not in self._queued_pages:
                 self._queued_pages.add(normalized)
                 queue.append(normalized)
 
-        processed: set[str] = set()
+        processed = set()
         while queue and len(processed) < self.max_pages:
             url = queue.popleft()
             if url in processed:
                 continue
             processed.add(url)
-            print(f"[page {len(processed):04d}] {url}")
+            print("[page {:04d}] {}".format(len(processed), url))
 
             try:
                 response = self.session.get(url, timeout=40, allow_redirects=True)
@@ -213,16 +224,23 @@ class Importer:
                 continue
 
             if response.status_code != 200:
-                self.page_failures.append(FailureRecord(url, f"HTTP {response.status_code}"))
+                self.page_failures.append(FailureRecord(url, "HTTP {}".format(response.status_code)))
                 continue
             content_type = response.headers.get("Content-Type", "")
-            if "html" not in content_type.lower() and not response.text.lstrip().lower().startswith(("<!doctype", "<html")):
+            if (
+                "html" not in content_type.lower()
+                and not response.text.lstrip().lower().startswith(("<!doctype", "<html"))
+            ):
                 continue
 
             final_url = response.url
             soup = BeautifulSoup(response.text, "html.parser")
             canonical_url = self.extract_canonical_url(soup, final_url)
-            canonical_page_url = self.normalize_page_url(canonical_url) or self.normalize_page_url(final_url) or url
+            canonical_page_url = (
+                self.normalize_page_url(canonical_url)
+                or self.normalize_page_url(final_url)
+                or url
+            )
             canonical_path = urlsplit(canonical_page_url).path or "/"
 
             self.discover_page_links(soup, final_url, queue)
@@ -235,9 +253,11 @@ class Importer:
                 self.pages[canonical_path] = snapshot
 
         if queue:
-            self.page_failures.append(FailureRecord(self.base_url, f"Limite pagine raggiunto: {self.max_pages}"))
+            self.page_failures.append(
+                FailureRecord(self.base_url, "Limite pagine raggiunto: {}".format(self.max_pages))
+            )
 
-    def discover_page_links(self, soup: BeautifulSoup, document_url: str, queue: deque[str]) -> None:
+    def discover_page_links(self, soup, document_url, queue):
         for tag in soup.find_all(["a", "link"]):
             href = tag.get("href")
             if not isinstance(href, str) or not href.strip():
@@ -251,7 +271,7 @@ class Importer:
                 self._queued_pages.add(candidate)
                 queue.append(candidate)
 
-    def normalize_page_url(self, url: str) -> str | None:
+    def normalize_page_url(self, url):
         try:
             parsed = urlsplit(urljoin(self.base_url, url))
         except ValueError:
@@ -268,18 +288,22 @@ class Importer:
         suffix = Path(unquote(path)).suffix.lower()
         if suffix not in PAGE_EXTENSIONS:
             return None
-
-        # Le query WordPress generano duplicati (tracking, preview, search): la route canonica usa il path.
         return urlunsplit((self.scheme, self.netloc, path, "", ""))
 
-    def extract_canonical_url(self, soup: BeautifulSoup, fallback: str) -> str:
-        canonical = soup.find("link", rel=lambda value: value and "canonical" in [str(v).lower() for v in (value if isinstance(value, list) else [value])])
+    def extract_canonical_url(self, soup, fallback):
+        canonical = soup.find(
+            "link",
+            rel=lambda value: value and "canonical" in [
+                str(v).lower()
+                for v in (value if isinstance(value, list) else [value])
+            ],
+        )
         href = canonical.get("href") if canonical else None
         if isinstance(href, str) and href.strip():
             return urljoin(fallback, href.strip())
         return fallback
 
-    def discover_and_mirror_assets(self, soup: BeautifulSoup, document_url: str) -> None:
+    def discover_and_mirror_assets(self, soup, document_url):
         for tag in soup.find_all(True):
             tag_name = tag.name.lower()
 
@@ -289,12 +313,22 @@ class Importer:
             ):
                 value = tag.get(attr_name)
                 if isinstance(value, str):
-                    self.consider_asset(value, document_url, forced=tag_name in {"script", "img", "source", "video", "audio"})
+                    self.consider_asset(
+                        value,
+                        document_url,
+                        forced=tag_name in {"script", "img", "source", "video", "audio"},
+                    )
 
             href = tag.get("href")
             if isinstance(href, str):
                 rel = {str(item).lower() for item in (tag.get("rel") or [])}
-                forced_link_asset = tag_name == "link" and bool(rel & {"stylesheet", "icon", "preload", "modulepreload", "manifest", "apple-touch-icon"})
+                forced_link_asset = (
+                    tag_name == "link"
+                    and bool(rel & {
+                        "stylesheet", "icon", "preload", "modulepreload",
+                        "manifest", "apple-touch-icon",
+                    })
+                )
                 self.consider_asset(href, document_url, forced=forced_link_asset)
 
             for attr_name in ("srcset", "data-srcset", "imagesrcset"):
@@ -309,7 +343,6 @@ class Importer:
             if isinstance(style, str):
                 self.discover_css_references(style, document_url)
 
-            # Elementor e plugin simili serializzano URL media in attributi data-* JSON.
             for attr_name, attr_value in list(tag.attrs.items()):
                 if not str(attr_name).startswith("data-"):
                     continue
@@ -319,15 +352,21 @@ class Importer:
                     text = str(attr_value)
                 if self.hostname in text:
                     for match in ABSOLUTE_URL_RE.findall(text):
-                        self.consider_asset(match.rstrip("\\),]}"), document_url, forced=False)
+                        self.consider_asset(
+                            match.rstrip("\\),]}"),
+                            document_url,
+                            forced=False,
+                        )
 
         for style_tag in soup.find_all("style"):
             if style_tag.string:
                 self.discover_css_references(style_tag.string, document_url)
 
-    def consider_asset(self, raw_url: str, document_url: str, forced: bool = False) -> None:
+    def consider_asset(self, raw_url, document_url, forced=False):
         raw_url = raw_url.strip()
-        if not raw_url or raw_url.startswith(("data:", "blob:", "javascript:", "mailto:", "tel:", "#")):
+        if not raw_url or raw_url.startswith(
+            ("data:", "blob:", "javascript:", "mailto:", "tel:", "#")
+        ):
             return
         absolute = urljoin(document_url, raw_url)
         parsed = urlsplit(absolute)
@@ -336,7 +375,12 @@ class Importer:
 
         host = (parsed.hostname or "").lower()
         suffix = Path(unquote(parsed.path)).suffix.lower()
-        is_asset = forced or suffix in STATIC_EXTENSIONS or "/wp-content/" in parsed.path or "/wp-includes/" in parsed.path
+        is_asset = (
+            forced
+            or suffix in STATIC_EXTENSIONS
+            or "/wp-content/" in parsed.path
+            or "/wp-includes/" in parsed.path
+        )
         if not is_asset:
             return
         if host != self.hostname:
@@ -345,7 +389,7 @@ class Importer:
 
         self.mirror_asset(absolute)
 
-    def mirror_asset(self, url: str) -> str | None:
+    def mirror_asset(self, url):
         parsed = urlsplit(url)
         key = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
         if key in self.assets:
@@ -367,24 +411,44 @@ class Importer:
                 self.asset_failures.append(FailureRecord(url, str(exc)))
                 return None
             if response.status_code != 200:
-                self.asset_failures.append(FailureRecord(url, f"HTTP {response.status_code}"))
+                self.asset_failures.append(
+                    FailureRecord(url, "HTTP {}".format(response.status_code))
+                )
                 return None
 
             length_header = response.headers.get("Content-Length")
-            if length_header and length_header.isdigit() and int(length_header) > ASSET_LIMIT_BYTES:
-                self.asset_failures.append(FailureRecord(url, f"asset oltre {ASSET_LIMIT_BYTES} byte"))
+            if (
+                length_header
+                and length_header.isdigit()
+                and int(length_header) > ASSET_LIMIT_BYTES
+            ):
+                self.asset_failures.append(
+                    FailureRecord(
+                        url,
+                        "asset oltre {} byte".format(ASSET_LIMIT_BYTES),
+                    )
+                )
                 return None
 
             content = response.content
             if len(content) > ASSET_LIMIT_BYTES:
-                self.asset_failures.append(FailureRecord(url, f"asset oltre {ASSET_LIMIT_BYTES} byte"))
+                self.asset_failures.append(
+                    FailureRecord(
+                        url,
+                        "asset oltre {} byte".format(ASSET_LIMIT_BYTES),
+                    )
+                )
                 return None
             content_type = response.headers.get("Content-Type", "application/octet-stream")
 
-            # Evita di archiviare pagine di errore HTML al posto di asset statici.
             expected_suffix = Path(unquote(parsed.path)).suffix.lower()
-            if expected_suffix in STATIC_EXTENSIONS and "text/html" in content_type.lower():
-                self.asset_failures.append(FailureRecord(url, "risposta HTML inattesa per asset"))
+            if (
+                expected_suffix in STATIC_EXTENSIONS
+                and "text/html" in content_type.lower()
+            ):
+                self.asset_failures.append(
+                    FailureRecord(url, "risposta HTML inattesa per asset")
+                )
                 return None
 
             local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -410,8 +474,8 @@ class Importer:
         finally:
             self._asset_in_progress.discard(key)
 
-    def discover_css_references(self, css_text: str, css_url: str) -> None:
-        candidates: set[str] = set()
+    def discover_css_references(self, css_text, css_url):
+        candidates = set()
         for match in CSS_URL_RE.finditer(css_text):
             candidates.add(match.group(2).strip())
         for match in CSS_IMPORT_RE.finditer(css_text):
@@ -419,7 +483,7 @@ class Importer:
         for candidate in candidates:
             self.consider_asset(candidate, css_url, forced=True)
 
-    def safe_public_path(self, url_path: str) -> Path | None:
+    def safe_public_path(self, url_path):
         decoded = unquote(url_path)
         parts = [part for part in decoded.split("/") if part not in {"", "."}]
         if not parts or any(part == ".." for part in parts):
@@ -431,7 +495,7 @@ class Importer:
             return None
         return target
 
-    def build_snapshot(self, soup: BeautifulSoup, source_url: str) -> dict:
+    def build_snapshot(self, soup, source_url):
         self.strip_wordpress_runtime_metadata(soup)
 
         title_tag = soup.find("title")
@@ -471,13 +535,16 @@ class Importer:
             "body_html": body_html,
         }
 
-        destination = self.pages_dir / f"{page_id}.json"
-        destination.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        destination = self.pages_dir / "{}.json".format(page_id)
+        destination.write_text(
+            json.dumps(snapshot, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         return snapshot
 
     @staticmethod
-    def normalize_attributes(attrs: dict) -> dict[str, str | bool]:
-        normalized: dict[str, str | bool] = {}
+    def normalize_attributes(attrs):
+        normalized = {}
         for name, value in attrs.items():
             if value is None:
                 normalized[str(name)] = True
@@ -488,7 +555,7 @@ class Importer:
         return normalized
 
     @staticmethod
-    def strip_wordpress_runtime_metadata(soup: BeautifulSoup) -> None:
+    def strip_wordpress_runtime_metadata(soup):
         for meta in soup.find_all("meta"):
             if str(meta.get("name", "")).lower() == "generator":
                 meta.decompose()
@@ -503,13 +570,19 @@ class Importer:
             if "api.w.org" in href or "wlwmanifest" in href:
                 link.decompose()
                 continue
-            if "application/json+oembed" in link_type or "text/xml+oembed" in link_type:
+            if (
+                "application/json+oembed" in link_type
+                or "text/xml+oembed" in link_type
+            ):
                 link.decompose()
                 continue
-            if "application/rss+xml" in link_type or "application/atom+xml" in link_type:
+            if (
+                "application/rss+xml" in link_type
+                or "application/atom+xml" in link_type
+            ):
                 link.decompose()
 
-    def record_runtime_dependencies(self, soup: BeautifulSoup, page_url: str) -> None:
+    def record_runtime_dependencies(self, soup, page_url):
         text = str(soup)
         for marker, label in RUNTIME_MARKERS.items():
             if marker.lower() in text.lower():
@@ -524,19 +597,36 @@ class Importer:
             if (parsed.hostname or "").lower() == self.hostname:
                 path = parsed.path or "/"
                 if path.startswith(("/wp-", "/xmlrpc")):
-                    self.runtime_dependencies.setdefault("Form endpoint WordPress", set()).add(page_url)
+                    self.runtime_dependencies.setdefault(
+                        "Form endpoint WordPress",
+                        set(),
+                    ).add(page_url)
 
-    def fetch_site_level_files(self) -> None:
+    def fetch_site_level_files(self):
         for path in ("favicon.ico", "site.webmanifest", "manifest.json"):
             url = urljoin(self.base_url, path)
             try:
                 response = self.session.get(url, timeout=20)
             except requests.RequestException:
                 continue
-            if response.ok and response.content and "text/html" not in response.headers.get("Content-Type", "").lower():
-                self._save_plain_public_file(url, response.content, response.headers.get("Content-Type", "application/octet-stream"))
+            if (
+                response.ok
+                and response.content
+                and "text/html" not in response.headers.get(
+                    "Content-Type",
+                    "",
+                ).lower()
+            ):
+                self._save_plain_public_file(
+                    url,
+                    response.content,
+                    response.headers.get(
+                        "Content-Type",
+                        "application/octet-stream",
+                    ),
+                )
 
-    def _save_plain_public_file(self, url: str, content: bytes, content_type: str) -> None:
+    def _save_plain_public_file(self, url, content, content_type):
         parsed = urlsplit(url)
         local_path = self.safe_public_path(parsed.path)
         if local_path is None:
@@ -552,9 +642,12 @@ class Importer:
             content_type=content_type.split(";", 1)[0].strip(),
         )
 
-    def write_routes(self) -> None:
+    def write_routes(self):
         routes = []
-        for path, snapshot in sorted(self.pages.items(), key=lambda item: (item[0] != "/", item[0])):
+        for path, snapshot in sorted(
+            self.pages.items(),
+            key=lambda item: (item[0] != "/", item[0]),
+        ):
             routes.append({
                 "name": self.route_name(path),
                 "path": path,
@@ -564,87 +657,145 @@ class Importer:
 
         config_path = self.output / "config" / "routes.php"
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        lines = ["<?php", "declare(strict_types=1);", "", "// Generato automaticamente da tools/import_wordpress.py.", "return ["]
+        lines = [
+            "<?php",
+            "declare(strict_types=1);",
+            "",
+            "// Generato automaticamente da tools/import_wordpress.py.",
+            "return [",
+        ]
         for route in routes:
             lines.append(
                 "    ["
-                f"'name' => {self.php_quote(route['name'])}, "
-                f"'path' => {self.php_quote(route['path'])}, "
-                f"'page' => {self.php_quote(route['page'])}],"
+                "'name' => {}, ".format(self.php_quote(route["name"]))
+                + "'path' => {}, ".format(self.php_quote(route["path"]))
+                + "'page' => {}],".format(self.php_quote(route["page"]))
             )
         lines.extend(["];", ""])
         config_path.write_text("\n".join(lines), encoding="utf-8")
 
         site_map_path = self.output / "storage" / "site-map.json"
         site_map_path.parent.mkdir(parents=True, exist_ok=True)
-        site_map_path.write_text(json.dumps(routes, ensure_ascii=False, indent=2), encoding="utf-8")
+        site_map_path.write_text(
+            json.dumps(routes, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
-    def write_reports(self) -> None:
+    def write_reports(self):
         report = {
             "source": self.base_url,
             "generated_at_epoch": int(time.time()),
             "pages": len(self.pages),
             "assets": len(self.assets),
-            "css_assets": sum(1 for record in self.assets.values() if record.public_path.lower().endswith(".css")),
-            "js_assets": sum(1 for record in self.assets.values() if record.public_path.lower().endswith((".js", ".mjs"))),
-            "external_asset_hosts": sorted(host for host in self.external_asset_hosts if host),
-            "runtime_dependencies": {key: sorted(value) for key, value in sorted(self.runtime_dependencies.items())},
-            "page_failures": [asdict(item) for item in self.page_failures],
-            "asset_failures": [asdict(item) for item in self.asset_failures],
-            "asset_manifest": [asdict(record) for record in sorted(self.assets.values(), key=lambda item: item.public_path)],
+            "css_assets": sum(
+                1
+                for record in self.assets.values()
+                if record.public_path.lower().endswith(".css")
+            ),
+            "js_assets": sum(
+                1
+                for record in self.assets.values()
+                if record.public_path.lower().endswith((".js", ".mjs"))
+            ),
+            "external_asset_hosts": sorted(
+                host for host in self.external_asset_hosts if host
+            ),
+            "runtime_dependencies": {
+                key: sorted(value)
+                for key, value in sorted(self.runtime_dependencies.items())
+            },
+            "page_failures": [item.to_dict() for item in self.page_failures],
+            "asset_failures": [item.to_dict() for item in self.asset_failures],
+            "asset_manifest": [
+                record.to_dict()
+                for record in sorted(
+                    self.assets.values(),
+                    key=lambda item: item.public_path,
+                )
+            ],
         }
         report_path = self.output / "storage" / "migration-report.json"
         report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
-    def print_summary(self) -> None:
+    def print_summary(self):
         print("\nImport completato")
-        print(f"  Pagine: {len(self.pages)}")
-        print(f"  Asset: {len(self.assets)}")
-        print(f"  Errori pagina: {len(self.page_failures)}")
-        print(f"  Errori asset: {len(self.asset_failures)}")
+        print("  Pagine: {}".format(len(self.pages)))
+        print("  Asset: {}".format(len(self.assets)))
+        print("  Errori pagina: {}".format(len(self.page_failures)))
+        print("  Errori asset: {}".format(len(self.asset_failures)))
         if self.runtime_dependencies:
             print("  Dipendenze WordPress residue rilevate:")
             for label, urls in sorted(self.runtime_dependencies.items()):
-                print(f"    - {label}: {len(urls)} pagina/e")
+                print("    - {}: {} pagina/e".format(label, len(urls)))
 
     @staticmethod
-    def page_id(path: str) -> str:
+    def page_id(path):
         if path == "/":
             return "home"
-        readable = re.sub(r"[^a-z0-9]+", "-", unquote(path).strip("/").lower()).strip("-")
+        readable = re.sub(
+            r"[^a-z0-9]+",
+            "-",
+            unquote(path).strip("/").lower(),
+        ).strip("-")
         readable = readable[:60] or "page"
         digest = hashlib.sha1(path.encode("utf-8")).hexdigest()[:8]
-        return f"{readable}-{digest}"
+        return "{}-{}".format(readable, digest)
 
     @staticmethod
-    def route_name(path: str) -> str:
+    def route_name(path):
         if path == "/":
             return "home"
-        readable = re.sub(r"[^a-z0-9]+", ".", unquote(path).strip("/").lower()).strip(".")
+        readable = re.sub(
+            r"[^a-z0-9]+",
+            ".",
+            unquote(path).strip("/").lower(),
+        ).strip(".")
         digest = hashlib.sha1(path.encode("utf-8")).hexdigest()[:6]
-        return f"page.{readable or 'route'}.{digest}"
+        return "page.{}.{}".format(readable or "route", digest)
 
     @staticmethod
-    def php_quote(value: str) -> str:
+    def php_quote(value):
         return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Migra il frontend pubblico WordPress di Chiabeatslife a Slim 4")
-    parser.add_argument("--base-url", required=True, help="URL radice del sito WordPress sorgente")
-    parser.add_argument("--output", default=".", help="Root del repository di destinazione")
-    parser.add_argument("--max-pages", type=int, default=PAGE_LIMIT, help="Limite di sicurezza del crawler")
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Migra il frontend pubblico WordPress di Chiabeatslife a Slim 4"
+    )
+    parser.add_argument(
+        "--base-url",
+        required=True,
+        help="URL radice del sito WordPress sorgente",
+    )
+    parser.add_argument(
+        "--output",
+        default=".",
+        help="Root del repository di destinazione",
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=PAGE_LIMIT,
+        help="Limite di sicurezza del crawler",
+    )
     return parser.parse_args()
 
 
-def main() -> int:
+def main():
     args = parse_args()
-    importer = Importer(args.base_url, Path(args.output), max_pages=max(1, args.max_pages))
+    importer = Importer(
+        args.base_url,
+        Path(args.output),
+        max_pages=max(1, args.max_pages),
+    )
     try:
         importer.run()
-    except Exception as exc:  # noqa: BLE001 - il workflow deve fallire con un messaggio leggibile.
-        print(f"ERRORE MIGRAZIONE: {exc}", file=sys.stderr)
+    except Exception as exc:
+        print("ERRORE MIGRAZIONE: {}".format(exc), file=sys.stderr)
         return 1
     return 0
 
